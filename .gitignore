@@ -1,0 +1,10 @@
+﻿# Secrets & lokale Artefakte
+.vs/
+.vscode/
+.venv/
+storage/
+__pycache__/
+*.pyc
+*.png
+.DS_Store
+.env

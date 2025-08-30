@@ -1,0 +1,13 @@
+﻿streamlit
+langchain
+langchain-openai
+langchain-community
+chromadb
+pypdf
+python-dotenv
+scikit-learn
+matplotlib
+pandas
+numpy
+sentence-transformers
+requests
