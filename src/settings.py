@@ -3,20 +3,31 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-# Versuche, Streamlit-Secrets zu lesen (in Cloud gesetzt)
-try:
-    import streamlit as st
-    _SECRETS = st.secrets  # type: ignore
-except Exception:
-    _SECRETS = {}
-
 def _get(key: str, default: str | None = None) -> str | None:
-    # Reihenfolge: ENV > Streamlit Secrets > Default
-    return os.environ.get(key) or _SECRETS.get(key) or default
+    """
+    Robust: zuerst ENV, dann (falls verfügbar) st.secrets.
+    Greift st.secrets nur innerhalb des try-Blocks an, damit kein Fehler hochploppt,
+    wenn in der Cloud noch keine Secrets hinterlegt sind.
+    """
+    # 1) Environment
+    val = os.environ.get(key)
+    if val not in (None, ""):
+        return val
+
+    # 2) Streamlit secrets (falls vorhanden/konfiguriert)
+    try:
+        import streamlit as st  # Import hier, um lokale Nutzung ohne Streamlit zu erlauben
+        try:
+            # st.secrets kann eine Exception werfen, wenn keine Secrets-Datei existiert
+            return st.secrets.get(key, default)  # type: ignore[attr-defined]
+        except Exception:
+            return default
+    except Exception:
+        return default
 
 # ---- OpenAI / Modelle ----
 OPENAI_API_KEY = _get("OPENAI_API_KEY", "")
-OPENAI_BASE_URL = _get("OPENAI_BASE_URL", "")  # bei OpenAI leer lassen
+OPENAI_BASE_URL = _get("OPENAI_BASE_URL", "")  # Bei OpenAI leer lassen
 OPENAI_MODEL = _get("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_EMBEDDING_MODEL = _get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
@@ -30,4 +41,8 @@ PERSIST_DIR = STORAGE_DIR / "chroma"
 
 # Verzeichnisse sicherstellen (Cloud & lokal)
 for p in [DATA_DIR, PDF_DIR, LOGS_DIR, STORAGE_DIR, PERSIST_DIR]:
-    p.mkdir(parents=True, exist_ok=True)
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # In sehr restriktiven Umgebungen ggf. read-only – dann einfach schlucken
+        pass
