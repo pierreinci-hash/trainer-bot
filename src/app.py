@@ -6,14 +6,13 @@ from typing import List, Tuple
 import pandas as pd
 
 from langchain_openai import ChatOpenAI
-from langchain_community.vectorstores import Chroma
 
 from settings import (
     OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL, OPENAI_EMBEDDING_MODEL,
     PERSIST_DIR, PDF_DIR, LOGS_DIR
 )
 from embeds import make_embeddings_with_fallback
-from ingest import collect_pdfs, load_and_split, build_vectorstore
+from ingest import collect_pdfs, load_and_split, build_vectorstore, load_vectorstore_any
 from trainings import (
     load_training_csv, to_long_form, weekly_summary, summarize_for_prompt,
     pr_report, plot_weekly_volume, plot_weekly_volume_by_muscle,
@@ -35,16 +34,6 @@ def init_embeddings():
 
 def init_llm(model_name: str):
     return ChatOpenAI(api_key=OPENAI_API_KEY, model=model_name, temperature=0.2)
-
-def load_vectorstore(embeddings):
-    if not Path(PERSIST_DIR).exists():
-        return None
-    try:
-        vs = Chroma(persist_directory=PERSIST_DIR, embedding_function=embeddings)
-        return vs
-    except Exception as e:
-        st.error(f"Fehler beim Laden des Vektorindex: {e}")
-        return None
 
 def docs_block_from_retrieval(docs: List, max_chars: int = 12000) -> str:
     parts = []
@@ -95,7 +84,6 @@ with st.sidebar:
 
     st.divider()
     st.subheader("📚 Studien (PDF)")
-    # --- NEU: PDF-Upload in die Cloud ---
     uploaded_pdfs = st.file_uploader("PDF(s) hochladen", type=["pdf"], accept_multiple_files=True)
     if uploaded_pdfs:
         for up in uploaded_pdfs:
@@ -114,8 +102,12 @@ with st.sidebar:
                     st.warning("Keine PDFs im Ordner 'data/pdfs' gefunden.")
                 else:
                     docs = load_and_split(pdfs)
-                    build_vectorstore(docs)
-                    st.success(f"Fertig! {len(docs)} Chunks indexiert.")
+                    embs = init_embeddings()
+                    backend, n = build_vectorstore(docs, embeddings=embs)
+                    if n == 0:
+                        st.warning("Es konnten keine Text-Chunks erzeugt werden.")
+                    else:
+                        st.success(f"Fertig! {n} Chunks indexiert. Backend: **{backend.upper()}**")
 
     st.subheader("📈 Trainingsdaten (CSV)")
     csv_files = [f for f in Path(LOGS_DIR).glob("*.csv")]
@@ -150,7 +142,6 @@ with st.sidebar:
             st.session_state['weekly'] = weekly
             st.session_state['train_summary'] = summarize_for_prompt(weekly)
 
-            # Mapping-Editor vorbereiten
             exercises = sorted(weekly["exercise"].unique().tolist()) if weekly is not None and not weekly.empty else []
             existing_map = load_muscle_mapping(str(MUSCLE_MAP_PATH)) if MUSCLE_MAP_PATH.exists() else {}
             st.session_state['muscle_map_df'] = pd.DataFrame(
@@ -158,7 +149,6 @@ with st.sidebar:
                 columns=["Übung", "Muskelgruppe"]
             )
 
-            # Großdiagramm: Volumen pro Muskelgruppe
             if st.session_state['muscle_map_df'] is not None and not st.session_state['muscle_map_df'].empty:
                 tmp_map = dict(zip(st.session_state['muscle_map_df']["Übung"], st.session_state['muscle_map_df']["Muskelgruppe"]))
                 weekly_m = build_weekly_by_muscle(weekly, tmp_map)
@@ -366,7 +356,8 @@ if user_input:
     embs = make_embeddings_with_fallback(OPENAI_API_KEY, OPENAI_EMBEDDING_MODEL)[0]
     llm = ChatOpenAI(api_key=OPENAI_API_KEY, model=OPENAI_MODEL or "gpt-4o-mini", temperature=0.2)
 
-    vs = load_vectorstore(embs)
+    # <- NEU: Index laden mit Backend-Erkennung
+    vs = load_vectorstore_any(embs)
     retrieved = []
     if vs is not None:
         retriever = vs.as_retriever(search_kwargs={'k': 4})

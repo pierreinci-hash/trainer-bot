@@ -11,3 +11,4 @@ pandas
 numpy
 sentence-transformers
 requests
+faiss-cpu
