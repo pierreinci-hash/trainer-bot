@@ -2,7 +2,7 @@
 import os
 import streamlit as st
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import pandas as pd
 
 from langchain_openai import ChatOpenAI
@@ -11,7 +11,7 @@ from settings import (
     OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL, OPENAI_EMBEDDING_MODEL,
     PERSIST_DIR, PDF_DIR, LOGS_DIR
 )
-from embeds import make_embeddings_with_fallback
+from embeds import make_embeddings_strict, StrictEmbeddingError
 from ingest import collect_pdfs, load_and_split, build_vectorstore, load_vectorstore_any
 from trainings import (
     load_training_csv, to_long_form, weekly_summary, summarize_for_prompt,
@@ -27,15 +27,20 @@ def _safe_file(name: str) -> str:
     return "".join(ch for ch in name if ch.isalnum() or ch in ("_", "-")).strip() or "plot"
 
 def init_embeddings():
-    embs, used_local = make_embeddings_with_fallback(OPENAI_API_KEY, OPENAI_EMBEDDING_MODEL)
-    if used_local:
-        st.warning("OpenAI-Embeddings nicht erreichbar – lokaler Fallback (all-MiniLM-L6-v2) aktiv.", icon="⚠️")
-    return embs
+    """Erstellt OpenAI-Embeddings (ohne Fallback) und validiert sie sofort."""
+    try:
+        embs = make_embeddings_strict(OPENAI_API_KEY, OPENAI_EMBEDDING_MODEL)
+        st.success(f"Embeddings OK: OpenAI ({OPENAI_EMBEDDING_MODEL})", icon="✅")
+        return embs
+    except StrictEmbeddingError as e:
+        st.error(str(e))
+        st.stop()
 
 def init_llm(model_name: str):
     return ChatOpenAI(api_key=OPENAI_API_KEY, model=model_name, temperature=0.2)
 
 def docs_block_from_retrieval(docs: List, max_chars: int = 12000) -> str:
+    """Baut einen kompakten Quellenblock mit Nummern [1].. und (source, page)."""
     parts = []
     total = 0
     for i, d in enumerate(docs, start=1):
@@ -48,6 +53,19 @@ def docs_block_from_retrieval(docs: List, max_chars: int = 12000) -> str:
             break
         parts.append(entry)
     return "\n\n".join(parts)
+
+def unique_sources_list(docs: List) -> List[str]:
+    """Liste eindeutiger Quellen (PDF + Seiten) zur Anzeige."""
+    seen = set()
+    items = []
+    for d in docs:
+        src = d.metadata.get("source", "?")
+        pg = d.metadata.get("page", "?")
+        key = (src, pg)
+        if key not in seen:
+            seen.add(key)
+            items.append(f"- **{src}**, Seite {pg}")
+    return items
 
 def _date_bounds_from_weekly(weekly) -> Tuple[pd.Timestamp, pd.Timestamp]:
     if weekly is None or weekly.empty:
@@ -66,7 +84,7 @@ def _apply_date_filter(long, weekly, start: pd.Timestamp, end: pd.Timestamp):
 
 # --------- Streamlit UI ---------
 st.set_page_config(page_title="AI Personal Trainer", layout="wide")
-st.title("🏋️‍♂️ AI Personal Trainer – RAG + Trainingsanalyse")
+st.title("🏋️‍♂️ AI Personal Trainer – RAG + Trainingsanalyse (OpenAI-Embeddings, MMR-Retrieval)")
 
 MUSCLE_MAP_PATH = Path("data/muscles.csv")  # Mapping-CSV
 
@@ -83,6 +101,15 @@ with st.sidebar:
     st.text_input("Embedding-Modell (nur Info)", value=OPENAI_EMBEDDING_MODEL, disabled=True)
 
     st.divider()
+    st.subheader("🔎 RAG-Einstellungen (Retriever)")
+    k_chunks = st.slider("Anzahl Chunks (k)", min_value=2, max_value=10, value=6, step=1,
+                         help="Wie viele Textstücke kommen in den Prompt?")
+    lambda_mult = st.slider("Diversität λ (0 = sehr ähnlich, 1 = sehr divers)", min_value=0.0, max_value=1.0, value=0.7, step=0.05,
+                            help="MMR steuert Balance zwischen Relevanz & Diversität.")
+    fetch_k = st.number_input("fetch_k (Vor-Auswahl für MMR)", min_value=10, max_value=100, value=20, step=5,
+                              help="Anzahl Kandidaten, aus denen MMR eine diverse Auswahl bildet.")
+
+    st.divider()
     st.subheader("📚 Studien (PDF)")
     uploaded_pdfs = st.file_uploader("PDF(s) hochladen", type=["pdf"], accept_multiple_files=True)
     if uploaded_pdfs:
@@ -96,13 +123,13 @@ with st.sidebar:
         if not OPENAI_API_KEY:
             st.error("Bitte zuerst OPENAI_API_KEY setzen (Secrets/.env).")
         else:
-            with st.spinner("Lese PDFs ein und erstelle Vektorindex ..."):
+            with st.spinner("Lese PDFs ein, prüfe Embeddings und erstelle Vektorindex ..."):
                 pdfs = collect_pdfs(PDF_DIR)
                 if not pdfs:
                     st.warning("Keine PDFs im Ordner 'data/pdfs' gefunden.")
                 else:
                     docs = load_and_split(pdfs)
-                    embs = init_embeddings()
+                    embs = init_embeddings()  # strikte OpenAI-Embeddings mit Selbsttest
                     backend, n = build_vectorstore(docs, embeddings=embs)
                     if n == 0:
                         st.warning("Es konnten keine Text-Chunks erzeugt werden.")
@@ -309,7 +336,7 @@ if user_input:
         st.error("Bitte zuerst OPENAI_API_KEY setzen (Secrets/.env).")
         st.stop()
 
-    # Shortcut: "plot:" nutzt den aktiven Zeitraum
+    # Shortcut: "plot:" nutzt den aktiven Zeitraum, ohne LLM
     if user_input.lower().startswith("plot:"):
         long = st.session_state.get('train_long'); weekly = st.session_state.get('weekly')
         if long is None or weekly is None or long.empty or weekly.empty:
@@ -353,15 +380,27 @@ if user_input:
 
     long_f, weekly_f = _apply_date_filter(long, weekly, start, end) if (long is not None and weekly is not None) else (None, None)
 
-    embs = make_embeddings_with_fallback(OPENAI_API_KEY, OPENAI_EMBEDDING_MODEL)[0]
+    # IMMER OpenAI-Embeddings (strikt, inkl. Selbsttest)
+    try:
+        embs = make_embeddings_strict(OPENAI_API_KEY, OPENAI_EMBEDDING_MODEL)
+    except StrictEmbeddingError as e:
+        st.error(str(e)); st.stop()
+
     llm = ChatOpenAI(api_key=OPENAI_API_KEY, model=OPENAI_MODEL or "gpt-4o-mini", temperature=0.2)
 
-    # <- NEU: Index laden mit Backend-Erkennung
     vs = load_vectorstore_any(embs)
     retrieved = []
     if vs is not None:
-        retriever = vs.as_retriever(search_kwargs={'k': 4})
+        # --- MMR-Retriever: diverse Quellen statt 1 Studie ---
         try:
+            retriever = vs.as_retriever(
+                search_type="mmr",
+                search_kwargs={
+                    "k": int(k_chunks),
+                    "fetch_k": int(fetch_k),
+                    "lambda_mult": float(lambda_mult),
+                },
+            )
             retrieved = retriever.get_relevant_documents(user_input)
         except Exception as e:
             st.warning(f"Retrieval fehlgeschlagen: {e}")
@@ -381,7 +420,7 @@ if user_input:
             answer = (
                 "Fehler beim LLM-Aufruf:\n\n"
                 f"```\n{e}\n```\n\n"
-                "Falls dein Netzwerk `api.openai.com` blockiert, nutze mobilen Hotspot/VPN."
+                "Prüfe OPENAI_API_KEY/Modell/Netzwerk."
             )
 
     st.session_state['messages'].append(("user", user_input))
@@ -392,5 +431,5 @@ if user_input:
 
     if retrieved:
         with st.expander("Verwendete Quellen / Passagen"):
-            for d in retrieved:
-                st.markdown(f"- **{d.metadata.get('source','?')}**, Seite {d.metadata.get('page','?')}")
+            for line in unique_sources_list(retrieved):
+                st.markdown(line)
